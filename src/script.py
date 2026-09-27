@@ -1,0 +1,218 @@
+import argparse
+import asyncio
+import csv
+import re
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+import pandas as pd
+from playwright.async_api import async_playwright
+
+BASE_URL = "https://bidplus.gem.gov.in/all-bids"
+
+
+def parse_date(value):
+    """Parse common date formats; return None if the value is not a date."""
+    value = (value or "").strip()
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%b-%Y",
+                "%d %b %Y", "%d-%B-%Y"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            pass
+
+    match = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", value)
+    if match:
+        day, month, year = map(int, match.groups())
+        try:
+            return datetime(year, month, day).date()
+        except ValueError:
+            return None
+    return None
+
+
+def safe_filename(text):
+    text = re.sub(r"[^\w.-]+", "_", text).strip("_.")
+    return (text[:100] or "tender")
+
+
+async def main():
+    parser = argparse.ArgumentParser(
+        description="Search GeM bids, filter by bid-end date, and download linked documents."
+    )
+    parser.add_argument(
+        "--keywords", nargs="+", required=True,
+        help='Keywords, e.g. --keywords "office chair" "ergonomic chair"'
+    )
+    parser.add_argument("--from-date", help="Include bids ending on/after DD-MM-YYYY")
+    parser.add_argument("--to-date", help="Include bids ending on/before DD-MM-YYYY")
+    parser.add_argument("--pages", type=int, default=5,
+                        help="Maximum result pages to inspect (default: 5)")
+    parser.add_argument("--out", default="gem_tenders",
+                        help="Output folder (default: gem_tenders)")
+    args = parser.parse_args()
+
+    start_date = parse_date(args.from_date) if args.from_date else None
+    end_date = parse_date(args.to_date) if args.to_date else None
+    if args.from_date and not start_date:
+        parser.error("Invalid --from-date. Use DD-MM-YYYY.")
+    if args.to_date and not end_date:
+        parser.error("Invalid --to-date. Use DD-MM-YYYY.")
+
+    output_dir = Path(args.out)
+    docs_dir = output_dir / "documents"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+
+    tenders = []
+    seen = set()
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(accept_downloads=True)
+        await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(2500)
+
+        # GeM may change its search controls. Locate a visible search field.
+        search = page.locator(
+            'input[type="search"], input[placeholder*="Search" i], '
+            'input[aria-label*="Search" i]'
+        ).first
+
+        if await search.count():
+            for keyword in args.keywords:
+                await search.fill(keyword)
+                await search.press("Enter")
+                await page.wait_for_timeout(1800)
+
+                for _ in range(args.pages):
+                    rows = page.locator("tr")
+                    row_count = await rows.count()
+
+                    for i in range(row_count):
+                        row = rows.nth(i)
+                        text = " ".join((await row.inner_text()).split())
+                        if not text or not any(
+                            word.lower() in text.lower()
+                            for word in keyword.split()
+                        ):
+                            continue
+
+                        links = await row.locator("a").evaluate_all(
+                            "(els) => els.map(a => ({text:a.innerText, href:a.href}))"
+                        )
+                        row_html = await row.inner_html()
+
+                        # Try to identify a bid-end date from the row text.
+                        date_match = re.search(
+                            r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b", text
+                        )
+                        end_text = date_match.group(0) if date_match else ""
+                        end_date = parse_date(end_text)
+
+                        if start_date and (not end_date or end_date < start_date):
+                            continue
+                        if end_date and end_date > (end_date or end_date):
+                            pass
+                        if args.to_date and end_date and end_date > parse_date(args.to_date):
+                            continue
+
+                        tender_url = next(
+                            (link["href"] for link in links
+                             if link["href"] and "bid" in link["href"].lower()),
+                            ""
+                        )
+                        key = tender_url or text
+                        if key in seen:
+                            continue
+                        seen.add(key)
+
+                        tenders.append({
+                            "keyword": keyword,
+                            "tender_details": text,
+                            "bid_end_date": end_text,
+                            "tender_url": tender_url,
+                            "links": links,
+                            "row_html": row_html,
+                        })
+
+                    # Move to the next page if a usable Next button exists.
+                    next_button = page.get_by_role(
+                        "button", name=re.compile(r"next", re.I)
+                    ).first
+                    if not await next_button.count() or not await next_button.is_enabled():
+                        break
+                    await next_button.click()
+                    await page.wait_for_timeout(1200)
+
+        else:
+            print(
+                "Could not find the page search box. GeM may have changed its "
+                "page layout; inspect the page and update the search selector."
+            )
+            await browser.close()
+            return
+
+        # Download documents linked from each result row.
+        for number, tender in enumerate(tenders, start=1):
+            folder = docs_dir / f"{number:03d}_{safe_filename(tender['tender_details'][:50])}"
+            folder.mkdir(parents=True, exist_ok=True)
+
+            for link_number, link in enumerate(tender["links"], start=1):
+                href = link.get("href", "")
+                if not href or href.startswith("javascript:"):
+                    continue
+
+                # Keep links that look like documents or tender attachments.
+                label = (link.get("text") or "").lower()
+                path = urlparse(href).path.lower()
+                if not (
+                    any(ext in path for ext in (".pdf", ".doc", ".xls", ".zip"))
+                    or any(word in label for word in
+                           ("document", "download", "corrigendum", "specification"))
+                ):
+                    continue
+
+                try:
+                    response = await page.request.get(href, timeout=30000)
+                    if not response.ok:
+                        continue
+                    content = await response.body()
+                    if not content:
+                        continue
+
+                    name = Path(urlparse(href).path).name
+                    if not name or "." not in name:
+                        name = f"document_{link_number}.bin"
+                    (folder / safe_filename(name)).write_bytes(content)
+                except Exception as exc:
+                    print(f"Could not download {href}: {exc}")
+
+        await browser.close()
+
+    # Sort dated records first, earliest bid-end date first.
+    def sort_key(item):
+        return parse_date(item["bid_end_date"]) or datetime.max.date()
+
+    tenders.sort(key=sort_key)
+
+    table_rows = []
+    for item in tenders:
+        table_rows.append({
+            "Bid End Date": item["bid_end_date"],
+            "Keyword": item["keyword"],
+            "Tender Details": item["tender_details"],
+            "Tender URL": item["tender_url"],
+        })
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "tender_list.csv"
+    pd.DataFrame(table_rows).to_csv(csv_path, index=False, quoting=csv.QUOTE_ALL)
+
+    print(f"Found {len(tenders)} matching tenders.")
+    print(f"Tender table: {csv_path}")
+    print(f"Downloaded documents (where available): {docs_dir}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
